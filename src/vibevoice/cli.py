@@ -106,7 +106,7 @@ Your responses will be directly typed into the user's keyboard at their cursor p
                 "prompt": user_prompt,
                 "system": system_prompt,
                 "stream": True,
-                "images": [screenshot_base64]  # Pass base64 data directly without data URI prefix
+                "images": [screenshot_base64]
             }
             print(f"Sending request with screenshot to model: {model}")
         else:
@@ -131,8 +131,6 @@ Your responses will be directly typed into the user's keyboard at their cursor p
                         chunk_text = chunk['response']
                         print(f"Debug - received chunk: {repr(chunk_text)}")
                         
-                        # Replace smart/curly quotes with standard apostrophes
-                        # U+2018 (') and U+2019 (') are both replaced with standard apostrophe (')
                         normalized_text = chunk_text.replace('\u2019', "'").replace('\u2018', "'")
                         
                         keyboard_controller.type(normalized_text)
@@ -150,35 +148,42 @@ def main():
     cmd_label = os.environ.get("VOICEKEY_CMD", "scroll_lock")
     RECORD_KEY = Key[key_label]
     CMD_KEY = Key[cmd_label]
-#    CMD_KEY = KeyCode(vk=65027)  # This is how you can use non-standard keys, this is AltGr for me
 
     recording = False
     audio_data = []
+    frames_captured = 0
     sample_rate = 16000
     keyboard_controller = KeyboardController()
 
     def on_press(key):
-        nonlocal recording, audio_data
-        if key == RECORD_KEY or key == CMD_KEY and not recording:
+        nonlocal recording, audio_data, frames_captured
+        if (key == RECORD_KEY or key == CMD_KEY) and not recording:
             recording = True
             audio_data = []
+            frames_captured = 0
             print("Listening...")
 
     def on_release(key):
         nonlocal recording, audio_data
-        if key == RECORD_KEY or key == CMD_KEY:
+        if (key == RECORD_KEY or key == CMD_KEY) and recording:
             recording = False
             print("Transcribing...")
             
             try:
                 audio_data_np = np.concatenate(audio_data, axis=0)
-            except ValueError as e:
-                print(e)
+            except ValueError:
+                print("No audio captured (0 buffers).")
                 return
             
+            x = audio_data_np.reshape(-1)
+            if not np.any(x):
+                print("Warning: audio was all zeros (mute/privacy/device?).")
+            
+            x = np.clip(x, -1.0, 1.0)
+            audio_data_int16 = (x * np.iinfo(np.int16).max).astype(np.int16)
             recording_path = os.path.abspath('recording.wav')
-            audio_data_int16 = (audio_data_np * np.iinfo(np.int16).max).astype(np.int16)
             wavfile.write(recording_path, sample_rate, audio_data_int16)
+            print(f"Wrote {recording_path}, {len(x)/sample_rate:.2f}s")
 
             try:
                 response = requests.post('http://localhost:4242/transcribe/', 
@@ -198,10 +203,12 @@ def main():
                 print(f"Error processing transcript: {e}")
 
     def callback(indata, frames, time, status):
+        nonlocal frames_captured
         if status:
-            print(status)
+            print("PortAudio status:", status)
         if recording:
             audio_data.append(indata.copy())
+            frames_captured += len(indata)
 
     server_process = start_whisper_server()
     
@@ -209,8 +216,10 @@ def main():
         print(f"Waiting for the server to be ready...")
         wait_for_server()
         print(f"vibevoice is active. Hold down {key_label} to start dictating.")
+        # Use explicit device if needed:
+        # dev = sd.default.device[0]
         with Listener(on_press=on_press, on_release=on_release) as listener:
-            with sd.InputStream(callback=callback, channels=1, samplerate=sample_rate):
+            with sd.InputStream(callback=callback, channels=1, samplerate=sample_rate, dtype='float32'):
                 listener.join()
     except TimeoutError as e:
         print(f"Error: {e}")
